@@ -67,7 +67,7 @@ def processUserReport(config):
         print("📖 Step 3: Loading Content Duration Data...")
         content_duration_df = (
             spark.read.parquet(ParquetFileConstants.CONTENT_COMPUTED_PARQUET_FILE)
-            .filter(col("category") == "Course")
+            .filter((col("courseCategory") == "Course") & (col("courseCategory") == "Moderated Course"))
             .select(
                 col("courseID").alias("content_id"),
                 col("courseDuration").cast("double"),
@@ -83,7 +83,6 @@ def processUserReport(config):
                 col("category").alias("external_category")
             )
         )
-        external_content_duration_df.show(5, truncate=False)
         print("✅ Step 3 Complete")
 
         # Step 4: Add User Status Classification

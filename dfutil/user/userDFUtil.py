@@ -262,13 +262,23 @@ def preComputeUserWarehouseData(spark):
         user_enrolment_df = spark.read.parquet(ParquetFileConstants.ENROLMENT_WAREHOUSE_COMPUTED_PARQUET_FILE)
         content_duration_df = (
             spark.read.parquet(ParquetFileConstants.CONTENT_COMPUTED_PARQUET_FILE)
-            .filter(col("category") == "Course")
+            .filter((col("courseCategory") == "Course") & (col("courseCategory") == "Moderated Course"))
             .select(col("courseID").alias("content_id"), col("courseDuration").cast("double"), col("category"))
+        )
+ 
+        external_content_duration_df = (
+            spark.read.parquet(ParquetFileConstants.EXTERNAL_CONTENT_COMPUTED_PARQUET_FILE)
+            .filter(col("category") == "External Content")
+            .select(
+                col("content_id"),
+                col("courseDuration").alias("external_courseDuration").cast("double"),
+                col("category").alias("external_category")
+            )
         )
 
         # Process data pipeline
         user_complete_data = (
-            appendContentDurationCompletionForEachUser(spark, user_master_df, user_enrolment_df, content_duration_df)
+            appendContentDurationCompletionForEachUser(spark, user_master_df, user_enrolment_df, content_duration_df, external_content_duration_df)
             .transform(lambda df: appendEventDurationCompletionForEachUser(spark, df))
             .withColumn("Tag", concat_ws(", ", col("additionalProperties.tag")))
             .withColumn("Total_Learning_Hours",

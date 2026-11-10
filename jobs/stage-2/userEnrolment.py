@@ -2,24 +2,48 @@ import findspark
 
 findspark.init()
 from pathlib import Path
+from pyspark import StorageLevel
 from pyspark.sql import SparkSession
 from pyspark.sql.types import StringType, DateType, IntegerType, StructType, StructField, BooleanType
 from pyspark.sql.functions import col, when, size, lit, expr, date_format, current_timestamp, \
     to_date, round, explode, to_utc_timestamp, from_utc_timestamp, to_timestamp, upper, concat, \
-    row_number, trim, exists, explode_outer, coalesce, format_string, split, from_unixtime, regexp_replace, from_json
+    row_number, trim, exists, coalesce, format_string, split, from_unixtime, regexp_replace, struct, from_json, broadcast, \
+    max as spark_max, min as spark_min
 from pyspark.sql.window import Window
 
 from datetime import datetime
 import sys
+import time
+import shutil
 
 sys.path.append(str(Path(__file__).resolve().parents[2]))
 from dfutil.enrolment import enrolmentDFUtil
-from dfutil.dfexport import dfexportutil
 from dfutil.assessment import assessmentDFUtil
 
 from constants.ParquetFileConstants import ParquetFileConstants
 from jobs.default_config import create_config
 from jobs.config import get_environment_config
+
+
+# Only the columns that the platform report + platform warehouse actually use.
+# Persisting just these (instead of every column from enrolment/content/user/batch)
+# keeps the cached data small enough to stay in memory.
+PLATFORM_COLS = [
+    "userID", "courseID", "batchID", "userOrgID",
+    # user details
+    "fullName", "professionalDetails", "personalDetails", "employmentDetails", "additionalProperties",
+    "userOrgName", "ministry_name", "dept_name", "userStatus", "Tag", "cadreName", "civilServiceType",
+    "civilServiceName", "cadreBatch", "organised_service", "role",
+    # content / batch
+    "courseOrgName", "courseName", "category", "courseDuration", "courseBatchName",
+    "courseBatchStartDate", "courseBatchEndDate", "courseLastPublishedOn", "ArchivedOn",
+    # enrolment
+    "enrolledOn", "completedOn", "firstCompletedOn", "lastContentAccessTimestamp",
+    "userCourseCompletionStatus", "completionPercentage", "courseProgress",
+    "Certificate_Generated", "Certificate_ID", "certificateGeneratedOn", "issuedCertificateCount",
+    "userRating", "karma_points", "badge_details", "enrolment_status",
+    "Report_Last_Generated_On", "live_cbp_plan_mandate", "unenrolled_on",
+]
 
 
 class UserEnrolmentModel:
@@ -53,6 +77,7 @@ class UserEnrolmentModel:
                              )
 
     def process_data(self, spark, config):
+        persisted = []
         try:
             today = self.get_date()
             currentDateTime = date_format(current_timestamp(), ParquetFileConstants.DATE_TIME_WITH_AMPM_FORMAT)
@@ -60,44 +85,58 @@ class UserEnrolmentModel:
             print("📥 Loading base DataFrames...")
             primary_categories = ["Course", "Program", "Blended Program", "CuratedCollections", "Curated Program"]
 
-            # Load and cache base DataFrames that are used multiple times
+            # Used once -> no cache needed.
             unenrolmentAuditDF = spark.read.parquet(ParquetFileConstants.UNENROLMENT_AUDIT_PARQUET_FILE) \
                 .filter(col('action') == 'UNENROLL') \
                 .select(
                 col("userid").alias("userID"),
                 col("courseid").alias("courseID"),
                 col("batchid").alias("batchID"),
-                col("actiondate").alias("unenrolledOn"),
-                col("action")
-            ).cache()
+                col("actiondate").alias("unenrolledOn"))
 
-            # A user/course/batch can have more than one unenrol record (e.g. unenrolled,
-            # re-enrolled, unenrolled again). Keep only the most recent one so the join
-            # below can't fan out and duplicate rows in the enrolment report.
+            # Keep only the latest unenrol record per user/course/batch so the join can't fan out.
             unenrolmentAuditLatestDF = (
                 unenrolmentAuditDF
-                .withColumn(
-                    "rn",
-                    row_number().over(
-                        Window.partitionBy("userID", "courseID", "batchID").orderBy(col("unenrolledOn").desc())
-                    )
-                )
+                .withColumn("rn", row_number().over(
+                    Window.partitionBy("userID", "courseID", "batchID").orderBy(col("unenrolledOn").desc())))
                 .filter(col("rn") == 1)
                 .drop("rn")
             )
 
-            enrolmentDF = spark.read.parquet(ParquetFileConstants.ENROLMENT_COMPUTED_PARQUET_FILE)
-            userOrgDF = spark.read.parquet(ParquetFileConstants.USER_ORG_COMPUTED_FILE)
-            contentOrgDF = spark.read.parquet(ParquetFileConstants.CONTENT_COMPUTED_PARQUET_FILE).filter(
-                col("category").isin(primary_categories))
-            # ================================================================
-            # CHANGE 2: Standalone Assessment enrolments - built entirely
-            # separately from the platform/marketplace enrolment logic below
-            # (Standalone Assessments have no real enrol event - no batch, no
-            # ENROLMENT_PARQUET_FILE record - so this is synthesized from
-            # assessment submission data instead). Nothing else in this file
-            # is touched by this block.
-            # ================================================================
+            enrolmentDF = (spark.read.parquet(ParquetFileConstants.ENROLMENT_COMPUTED_PARQUET_FILE)
+                           .select("userID", "courseID", "batchID", "courseProgress", "dbCompletionStatus",
+                                   "courseCompletedTimestamp", "courseEnrolledTimestamp",
+                                   "lastContentAccessTimestamp", "issuedCertificateCount", "firstCompletedOn",
+                                   "certificateGeneratedOn", "certificateID", "issued_badges", "enrolment_status",
+                                   "courseBatchName", "courseBatchStartDate", "courseBatchEndDate",
+                                   "userRating", "karma_points")
+                           .dropDuplicates(["userID", "courseID", "batchID"]))
+
+            # Structs are rebuilt with only the sub-fields the report reads, so every
+            # downstream col("personalDetails.mobile") etc. keeps working unchanged.
+            userOrgDF = (spark.read.parquet(ParquetFileConstants.USER_ORG_COMPUTED_FILE)
+            .select(
+                "userID", "userOrgID", "userOrgName", "ministry_name", "dept_name", "userStatus",
+                "fullName", "Tag", "cadreName", "civilServiceType", "civilServiceName", "cadreBatch",
+                "organised_service", "role",
+                struct(col("personalDetails.primaryEmail").alias("primaryEmail"),
+                       col("personalDetails.mobile").alias("mobile"),
+                       col("personalDetails.gender").alias("gender"),
+                       col("personalDetails.category").alias("category")).alias("personalDetails"),
+                struct(col("professionalDetails.designation").alias("designation"),
+                       col("professionalDetails.group").alias("group")).alias("professionalDetails"),
+                struct(col("employmentDetails.employeeCode").alias("employeeCode")).alias("employmentDetails"),
+                struct(col("additionalProperties.externalSystem").alias("externalSystem"),
+                       col("additionalProperties.externalSystemId").alias("externalSystemId")
+                       ).alias("additionalProperties")))
+
+            contentOrgDF = (spark.read.parquet(ParquetFileConstants.CONTENT_COMPUTED_PARQUET_FILE)
+                            .filter(col("category").isin(primary_categories))
+                            .select("courseID", "category", "courseOrgName", "courseName", "courseDuration",
+                                    "courseLastPublishedOn", "courseStatus", "lastStatusChangedOn",
+                                    "courseResourceCount"))
+
+            # ================= Standalone Assessment enrolments (unchanged) =================
             print("🔄 Processing Standalone Assessment enrolments...")
             standaloneAssessRawDF = assessmentDFUtil.standalone_assessment_enrolments_dataframe(spark)
 
@@ -130,19 +169,20 @@ class UserEnrolmentModel:
                 lit(0).cast(IntegerType()).alias("karma_points"),
                 col("data_last_generated_on")
             )
-            # ================================================================
-            # END CHANGE 2
-            # ================================================================
+
+            # ================= Platform enrolments =================
             print("🔄 Processing platform enrolments...")
-            # Compute and cache the main platform join result
-            allCourseProgramCompletionWithDetailsDFWithRating = enrolmentDFUtil.preComputeUserOrgEnrolment(enrolmentDF,
-                                                                                                           contentOrgDF,
-                                                                                                           userOrgDF,
-                                                                                                           spark)
-            # Process platform data and cache the result
+            platformJoinedDF = (enrolmentDF
+                                .join(broadcast(contentOrgDF), ["courseID"], "inner")
+                                .join(userOrgDF, ["userID"], "left"))
+            platformJoinedDF = enrolmentDFUtil.withCompletionPercentageColumn(platformJoinedDF)
+            allCourseProgramCompletionWithDetailsDFWithRating = \
+                enrolmentDFUtil.withUserCourseCompletionStatusColumn(platformJoinedDF)
+
             df = (
                 UserEnrolmentModel.duration_format(allCourseProgramCompletionWithDetailsDFWithRating, "courseDuration")
-                .withColumn("badge_details", explode_outer("issued_badges"))
+                # First badge instead of explode_outer: no row fan-out before the dedup shuffle.
+                .withColumn("badge_details", col("issued_badges").getItem(0))
                 .withColumn("completedOn",
                             date_format(col("courseCompletedTimestamp"), ParquetFileConstants.DATE_TIME_FORMAT))
                 .withColumn("enrolledOn",
@@ -164,15 +204,14 @@ class UserEnrolmentModel:
                             when(col("courseStatus") == "Retired", col("lastStatusChangedOn")).otherwise(""))
                 .withColumn("ArchivedOn", to_date(col("ArchivedOn"), ParquetFileConstants.DATE_FORMAT))
                 .withColumn("Certificate_ID", col("certificateID"))
-                .dropDuplicates(["userID", "courseID", "batchID"])
             )
-            print("🔄 Processing external/marketplace enrolments...")
 
-            # Load external data
-            externalEnrolmentDF = spark.read.parquet(ParquetFileConstants.EXTERNAL_ENROLMENT_COMPUTED_PARQUET_FILE).withColumn("badge_details", explode_outer("issued_badges"))
+            # ================= Marketplace enrolments =================
+            print("🔄 Processing external/marketplace enrolments...")
+            externalEnrolmentDF = spark.read.parquet(ParquetFileConstants.EXTERNAL_ENROLMENT_COMPUTED_PARQUET_FILE) \
+                .withColumn("badge_details", col("issued_badges").getItem(0))
             externalContentOrgDF = spark.read.parquet(ParquetFileConstants.EXTERNAL_CONTENT_COMPUTED_PARQUET_FILE)
 
-            # Process marketplace data and cache
             marketPlaceContentEnrolmentsDF = (
                 UserEnrolmentModel.duration_format(externalContentOrgDF, "courseDuration")
                 .join(externalEnrolmentDF, "content_id", "inner")
@@ -208,26 +247,28 @@ class UserEnrolmentModel:
                 .fillna(0, subset=["courseProgress", "issuedCertificateCount"])
                 .fillna("", subset=["certificateGeneratedOn"])
             )
-            marketPlaceEnrolmentsWithUserDetailsDF = marketPlaceContentEnrolmentsDF.join(userOrgDF, ["userID"], "left")
+            marketPlaceEnrolmentsWithUserDetailsDF = marketPlaceContentEnrolmentsDF \
+                .join(userOrgDF, ["userID"], "left") \
+                .persist(StorageLevel.MEMORY_AND_DISK)
+            persisted.append(marketPlaceEnrolmentsWithUserDetailsDF)
 
+            # ================= ACBP =================
             print("🔄 Processing ACBP data...")
-            course_schema = StructType([
+            acbp_course_schema = StructType([
                 StructField("identifier", StringType(), True),
                 StructField("mandatory", BooleanType(), True),
             ])
-
-            # Load and process ACBP data
             acbpAllEnrolmentDF = (spark.read.parquet(ParquetFileConstants.ACBP_COMPUTED_FILE)
-                                  .withColumn("rawCourse", explode(col("acbpCourseIDList"))) \
-                                  .withColumn("parsedCourse", from_json(col("rawCourse"), course_schema)) \
-                                  .withColumn("courseID", coalesce(col("parsedCourse.identifier"), col("rawCourse"))) \
-                                  .withColumn("courseID", regexp_replace(col("courseID"), r"^\s*\[|\]\s*$|\s+", "")) \
-                                  .withColumn("liveCBPlan", lit(True))
-                                  .select(col("userOrgID"), col("courseID"), col("userID"),
-                                          col("designation"), col("liveCBPlan")))
+                .select("userID", "userOrgID", "acbpCourseIDList")
+                .withColumn("rawCourse", explode(col("acbpCourseIDList"))) \
+                .withColumn("parsedCourse", from_json(col("rawCourse"), acbp_course_schema)) \
+                .withColumn("courseID", coalesce(col("parsedCourse.identifier"), col("rawCourse"))) \
+                .withColumn("courseID", regexp_replace(col("courseID"), r"^\s*\[|\]\s*$|\s+", "")) \
+                .select("userOrgID", "courseID", "userID")
+                .dropDuplicates(["userID", "userOrgID", "courseID"])
+                .withColumn("liveCBPlan", lit(True))
+            )
 
-            # Join platform data with ACBP, then with the (de-duplicated) unenrolment audit
-            # data, in a single chain so neither join gets thrown away.
             enrolmentWithACBP = (
                 df.join(acbpAllEnrolmentDF, ["userID", "userOrgID", "courseID"], "left")
                 .withColumn("live_cbp_plan_mandate",
@@ -238,13 +279,18 @@ class UserEnrolmentModel:
                             when(col("unenrolledOn").isNotNull(),
                                  date_format(col("unenrolledOn"), ParquetFileConstants.DATE_TIME_FORMAT))
                             .otherwise(lit(None).cast(StringType())))
-                .drop("action", "unenrolledOn")
+                .select(*PLATFORM_COLS)
             )
 
+            platformIntermediatePath = f"{config.localReportDir}/temp/user-enrolment-platform-intermediate/{today}"
+            t0 = time.time()
+            print(f"💾 Writing platform intermediate parquet -> {platformIntermediatePath}")
+            enrolmentWithACBP.write.mode("overwrite").option("compression", "snappy").parquet(platformIntermediatePath)
+            print(f"⏱️  Joins + intermediate write: {time.time() - t0:.1f}s")
+            enrolmentWithACBP = spark.read.parquet(platformIntermediatePath)
 
             print("🔄 Generating reports...")
 
-            # Generate marketplace report
             mdoMarketplaceReport = (marketPlaceEnrolmentsWithUserDetailsDF
             .withColumn("MDO_Name", col("userOrgName"))
             .withColumn("Ministry",
@@ -315,7 +361,7 @@ class UserEnrolmentModel:
                 col("is_enrolled"),
                 col("enrolment_status"),
                 col("unenrolled_on"),
-                col("role").alias("Roles")  # used only to classify Govt / Non-Govt users, dropped before write
+                col("role").alias("Roles")
             )
             )
 
@@ -429,16 +475,11 @@ class UserEnrolmentModel:
                 col("Certificate_ID"),
                 col("Report_Last_Generated_On"),
                 col("live_cbp_plan_mandate").alias("Live_CBP_Plan_Mandate"),
-                col("userID"),
-                col("courseID"),
                 col("is_enrolled"),
                 col("enrolment_status"),
                 when(col("enrolment_status") == "unenrolled", col("unenrolled_on")).otherwise(None).alias("unenrolled_on"),
-                col("role").alias("Roles")  # used only to classify Govt / Non-Govt users, dropped before write
-            )
-                                 .dropDuplicates(["userID", "Batch_Id", "courseID"])
-                                 .drop("userID", "courseID")
-                                 )
+                col("role").alias("Roles")
+            ))
 
             platformWarehouseDF = (enrolmentWithACBP
                                    .withColumn("certificate_generated_on",
@@ -475,10 +516,8 @@ class UserEnrolmentModel:
                 col("live_cbp_plan_mandate"),
                 col("data_last_generated_on"),
                 col("karma_points"),
-                col("badge_details")["badgeId"].alias("badge_id"),
-            )
+                col("badge_details")["badgeId"].alias("badge_id"))
                                    .fillna(0, subset=["karma_points"])
-                                   .dropDuplicates(["user_id", "batch_id", "content_id"])
                                    )
 
             print("🔄 Combining and writing final outputs...")
@@ -488,14 +527,7 @@ class UserEnrolmentModel:
                 .union(mdoMarketplaceReport)
             )
 
-            platform_enrolments_df = mdoPlatformReport
-            marketplace_enrolments_df = mdoMarketplaceReport
-
-            # ---- Govt / Non-Govt classification ----
-            # Exact (trimmed, case-insensitive) match on Designation, and an exact
-            # match against any element of the Roles array. Using .contains(...)
-            # here would wrongly flag designations like "Civil Defence Volunteer"
-            # as Non-Govt just because the substring "VOLUNTEER" appears in them.
+            # ---- Govt / Non-Govt classification (exact match, same rules as before) ----
             mdoReportDF = mdoReportDF.withColumn(
                 "is_non_govt_user",
                 when(
@@ -503,101 +535,73 @@ class UserEnrolmentModel:
                     coalesce(exists(split(coalesce(col("Roles"), lit("")), ","), lambda r: trim(upper(r)) == "VOLUNTEER"), lit(False)),
                     lit(True)
                 ).otherwise(lit(False))
-            ).cache()
-
-            govt_part_df = mdoReportDF.filter(~col("is_non_govt_user")).drop("is_non_govt_user", "Roles")
-            non_govt_part_df = mdoReportDF.filter(col("is_non_govt_user")).drop("is_non_govt_user", "Roles")
-
-            # Determine, per org, whether it has govt users, non-govt users, or both.
-            govt_org_ids = set(
-                row.mdoid for row in govt_part_df.select("mdoid").distinct().collect() if row.mdoid is not None
             )
-            non_govt_org_ids = set(
-                row.mdoid for row in non_govt_part_df.select("mdoid").distinct().collect() if row.mdoid is not None
-            )
+
+            # ONE small aggregation instead of two distinct().collect() passes.
+            t0 = time.time()
+            org_flags = (mdoReportDF
+                         .filter(col("mdoid").isNotNull())
+                         .groupBy("mdoid")
+                         .agg(spark_max(col("is_non_govt_user").cast("int")).alias("any_non_govt"),
+                              spark_min(col("is_non_govt_user").cast("int")).alias("all_non_govt"))
+                         .collect())
+            print(f"⏱️  Org classification: {time.time() - t0:.1f}s")
+            govt_org_ids = {r.mdoid for r in org_flags if r.all_non_govt == 0}
+            non_govt_org_ids = {r.mdoid for r in org_flags if r.any_non_govt == 1}
             both_org_ids = govt_org_ids & non_govt_org_ids
 
             print(f"Orgs with only Govt users: {len(govt_org_ids - both_org_ids)}")
             print(f"Orgs with only Non-Govt users: {len(non_govt_org_ids - both_org_ids)}")
             print(f"Orgs with BOTH Govt and Non-Govt users (2 reports each): {len(both_org_ids)}")
 
-            # Govt subset keeps its mdoid unchanged (mdoid=<org_id>).
-            # Non-Govt subset keeps its mdoid unchanged too UNLESS the same org also has
-            # Govt users, in which case its folder becomes mdoid=<org_id>_non_govt so the
-            # two reports for that org don't collide.
-            both_org_ids_list = list(both_org_ids)
-            non_govt_part_df = non_govt_part_df.withColumn(
+            # Non-Govt rows of orgs that also have Govt users go to mdoid=<org_id>_non_govt;
+            # everything else keeps its mdoid. Folders never collide, so one write is enough.
+            reportOutDF = mdoReportDF
+            if both_org_ids:
+                reportOutDF = reportOutDF.withColumn(
                 "mdoid",
-                when(col("mdoid").isin(both_org_ids_list), concat(col("mdoid"), lit("_non_govt")))
-                .otherwise(col("mdoid"))
-            )
+                when(col("is_non_govt_user") & col("mdoid").isin(list(both_org_ids)),
+                         concat(col("mdoid"), lit("_non_govt")))
+                .otherwise(col("mdoid")))
+            reportOutDF = reportOutDF.drop("is_non_govt_user", "Roles")
 
-            enrolment_out_path = f"{config.localReportDir}/{config.userEnrolmentReportPath}/{today}"
-
-            print("📝 Writing CSV reports...")
-
-            # dfexportutil.write_csv_per_mdo_id_duckdb throws a KeyError on
-            # 'successful_conversions' when it's handed a dataframe with zero
-            # orgs/partitions to write (e.g. no Non-Govt/VOLUNTEER users found
-            # in this run at all). Guard each write so an empty subset doesn't
-            # crash the whole job.
-            if govt_org_ids:
-                print(f"➡️  Writing GOVT user enrolment report -> {enrolment_out_path}")
-                dfexportutil.write_csv_per_mdo_id_duckdb(
-                    govt_part_df,
-                    enrolment_out_path,
-                    'mdoid',
-                    f"{config.localReportDir}/temp/user_enrolment_report/{today}",
-                    csv_filename=config.userEnrollmentReport
-                )
-            else:
-                print("ℹ️  No Govt users found in this run — skipping Govt CSV write.")
-
-            if non_govt_org_ids:
-                print(f"➡️  Writing NON-GOVT user enrolment report -> {enrolment_out_path}")
-                dfexportutil.write_csv_per_mdo_id_duckdb(
-                    non_govt_part_df,
-                    enrolment_out_path,
-                    'mdoid',
-                    f"{config.localReportDir}/temp/user_enrolment_report_non_govt/{today}",
-                    csv_filename=config.userEnrollmentReport
-                )
-            else:
-                print("ℹ️  No Non-Govt (VOLUNTEER) users found in this run — skipping Non-Govt CSV write.")
+            enrolmentReportPlainPath = f"{config.localReportDir}/temp/user-enrolment-report-plain/{today}"
+            print(f"📝 Writing plain parquet for user enrolment report -> {enrolmentReportPlainPath}")
+            t0 = time.time()
+            reportOutDF.write.mode("overwrite").option("compression", "snappy").parquet(enrolmentReportPlainPath)
+            print(f"⏱️  Report parquet write: {time.time() - t0:.1f}s")
 
             print("📦 Writing warehouse data...")
+            t0 = time.time()
             warehouseDF = platformWarehouseDF.unionByName(marketPlaceWarehouseDF).unionByName(standaloneAssessWarehouseDF)
-            warehouseDF.coalesce(1).write.mode("overwrite").option("compression", "snappy").parquet(
+            warehouseDF.write.mode("overwrite").option("compression", "snappy").parquet(
                 f"{config.warehouseReportDir}/{config.dwEnrollmentsTable}")
-
-            mdoReportDF.unpersist()
+            print(f"⏱️  Warehouse write: {time.time() - t0:.1f}s")
+            shutil.rmtree(platformIntermediatePath, ignore_errors=True)
 
             print("✅ Processing completed successfully!")
 
         except Exception as e:
             print(f"❌ Error occurred during UserEnrolmentModel processing: {str(e)}")
-            raise e
-            sys.exit(1)
+            raise
+        finally:
+            for d in persisted:
+                d.unpersist()
 
 
 def main():
-    # Initialize Spark Session with optimized settings for caching
     spark = SparkSession.builder \
-        .appName("User Enrolment Report Model - Cached") \
-        .config("spark.master", "local[16]") \
-        .config("spark.sql.shuffle.partitions", "240") \
-        .config("spark.executor.memory", "30g") \
+        .appName("User Enrolment Report Model - Optimized") \
+        .config("spark.master", "local[*]") \
         .config("spark.driver.memory", "128g") \
-        .config("spark.driver.memoryOverhead", "20g") \
-        .config("spark.executor.memoryFraction", "0.7") \
-        .config("spark.storage.memoryFraction", "0.2") \
-        .config("spark.storage.unrollFraction", "0.1") \
+        .config("spark.sql.shuffle.partitions", "256") \
         .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
         .config("spark.sql.adaptive.enabled", "true") \
         .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
+        .config("spark.sql.adaptive.skewJoin.enabled", "true") \
+        .config("spark.sql.autoBroadcastJoinThreshold", str(100 * 1024 * 1024)) \
         .config("spark.sql.legacy.timeParserPolicy", "LEGACY") \
         .getOrCreate()
-    # Create model instance
 
     config_dict = get_environment_config()
     config = create_config(config_dict)
@@ -606,12 +610,10 @@ def main():
     model = UserEnrolmentModel()
     model.process_data(spark, config)
     end_time = datetime.now()
-    duration = end_time - start_time
     print(f"[END] UserEnrolmentModel processing completed at: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"[INFO] Total duration: {duration}")
+    print(f"[INFO] Total duration: {end_time - start_time}")
     spark.stop()
 
 
-# Example usage:
 if __name__ == "__main__":
     main()

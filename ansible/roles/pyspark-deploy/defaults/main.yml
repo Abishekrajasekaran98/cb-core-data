@@ -88,6 +88,8 @@ peerValidationKafkaTopic: "{{env}}.peer.survey.notification.sent"
 dw_postgres_host: "{{groups['dw-postgres'][0]}}:5432"
 dw_postgres_credential: "{{dp_vault_pgdb_password}}"
 
+dw_clickhouse_host: "{{dw_clickhouse_host}}"
+dw_clickhouse_credential: "{{dw_clickhouse_credential}}"
 mongo_node_bb_host: "{{groups['mongodb-nodebb'][0]}}"
 ml_mongo_host: "{{groups['ml-mongodb-host'][0]}}"
 dashboards_mongo_discussions_db: "nodebb"

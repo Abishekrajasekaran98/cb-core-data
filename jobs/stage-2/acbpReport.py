@@ -2,11 +2,12 @@ import findspark
 
 findspark.init()
 import time
+import shutil
 from pathlib import Path
 from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.types import StringType, StructType, StructField, LongType, ArrayType, BooleanType
-from pyspark.sql.functions import col, desc, row_number, udf, create_map, trim, array_join, countDistinct, split, \
-    regexp_replace, when,lit, date_format, from_json, current_timestamp, explode, sum as spark_sum
+from pyspark.sql.functions import col, desc, row_number, create_map, trim, array_join, split, \
+    regexp_replace, when,lit, date_format, from_json, explode, broadcast, sum as spark_sum
 from pyspark.sql.window import Window
 from itertools import chain
 from datetime import datetime
@@ -14,12 +15,29 @@ import sys
 
 sys.path.append(str(Path(__file__).resolve().parents[2]))
 from dfutil.content import contentDFUtil
-
-from dfutil.dfexport import dfexportutil
 from jobs.config import get_environment_config
 from jobs.default_config import create_config
 
 from constants.ParquetFileConstants import ParquetFileConstants
+
+# ----------------------------------------------------------------------------
+# Columns kept in the joined ACBP x content x enrolment intermediate: the union
+# of what the enrolment report, the user summary and the APAR data read.
+# Nothing else is carried through the join / window shuffles or written to disk.
+# ----------------------------------------------------------------------------
+CORE_COLS = [
+    "userID", "courseID",
+    # user details (come with acbp-computed)
+    "fullName", "userPrimaryEmail", "userMobile", "userOrgName", "group", "designation",
+    "ministry_name", "dept_name", "cadreName", "civilServiceType", "civilServiceName",
+    "cadreBatch", "organised_service", "userOrgID", "employeeCode", "userStatus",
+    # plan details
+    "isapar", "acbpStatus", "allocatedOn", "completionDueDate", "planyear", "plantype", "isACBPMandatory",
+    # content details
+    "courseName", "courseStatus", "courseDuration", "courseCategory",
+    # enrolment details
+    "dbCompletionStatus", "courseCompletedTimestamp", "courseProgress",
+]
 
 
 class ACBPModel:
@@ -34,26 +52,28 @@ class ACBPModel:
         return datetime.now().strftime("%Y-%m-%d")
 
     def process_data(self, spark, config):
+        intermediatePath = None
         try:
             start_time = time.time()
             stage_start = time.time()
             today = self.get_date()
-            currentDateTime = date_format(current_timestamp(), ParquetFileConstants.DATE_TIME_WITH_AMPM_FORMAT)
+
+            # Evaluated ONCE and used as a literal, so every output of this run carries the
+            # same "generated on" time (current_timestamp() is re-evaluated per Spark action).
+            reportGeneratedOn = spark.sql(
+                f"SELECT date_format(current_timestamp(), '{ParquetFileConstants.DATE_TIME_WITH_AMPM_FORMAT}')"
+            ).first()[0]
+            currentDateTime = lit(reportGeneratedOn)
+
             primary_categories = ["Course", "Program", "Blended Program", "Curated Program", "Standalone Assessment"]
 
             print("📥 Reading source data...")
-            userOrgDF = spark.read.parquet(ParquetFileConstants.USER_ORG_COMPUTED_FILE).select("userID",
-                                                                                               "fullName",
-                                                                                               "userStatus",
-                                                                                               "userPrimaryEmail",
-                                                                                               "userMobile",
-                                                                                               "userOrgID",
-                                                                                               "ministry_name",
-                                                                                               "dept_name",
-                                                                                               "userOrgName",
-                                                                                               "designation", "group",
-                                                                                               "additionalProperties.externalSystem",
-                                                                                               "additionalProperties.externalSystemId")
+            # Only the APAR output needs anything from the user file (external system ids);
+            # all other user details already come with acbp-computed.
+            userAdditionalProperties = spark.read.parquet(ParquetFileConstants.USER_ORG_COMPUTED_FILE).select(
+                "userID",
+                col("additionalProperties.externalSystem").alias("externalSystem"),
+                col("additionalProperties.externalSystemId").alias("externalSystemId"))
 
             allCourseProgramESDF = spark.read.parquet(
                 ParquetFileConstants.ALL_COURSE_PROGRAM_COMPUTED_PARQUET_FILE).filter(
@@ -65,28 +85,71 @@ class ACBPModel:
                                          .fillna(0.0, subset=["courseDuration"])
                                          .fillna(0, subset=["courseResourceCount"]))
 
-            enrolmentDF = spark.read.parquet(ParquetFileConstants.ENROLMENT_COMPUTED_PARQUET_FILE).filter(col('enrolment_status') == 'enrolled')
-
-            acbpAllEnrolDF = spark.read.parquet(ParquetFileConstants.ACBP_COMPUTED_FILE)
-
             course_schema = StructType([
                 StructField("identifier", StringType(), True),
                 StructField("mandatory", BooleanType(), True),
             ])
+            course_id_regex = r"^\s*\[|\]\s*$|\s+"
 
-            acbpAllEnrolmentDF = (acbpAllEnrolDF \
-                                  .withColumn("courseIDList", explode(col("acbpCourseIDList"))) \
-                                  .withColumn("courseIDList", from_json(col("courseIDList"), course_schema)) \
-                                  .withColumn("courseID", col("courseIDList.identifier")) \
-                                  .withColumn("isACBPMandatory", col("courseIDList.mandatory")) \
-                                  .withColumn("courseID", regexp_replace(col("courseID"), r"^\s*\[|\]\s*$|\s+", "")) \
-                                  .join(allCourseProgramDetailsDF, ["courseID"], "left") \
-                                  .join(enrolmentDF, ["courseID", "userID"], "left") \
-                                  .na.drop(subset=["userID", "courseID"]) \
-                                  .drop("acbpCourseIDList") \
-                                  )
+            # Course IDs that appear in any Live plan, taken from the small (26 MB) acbp-select file
+            # with the same parsing as below. acbp-computed is built from these same Live plans, so
+            # an enrolment for any other course can never match the left join -> drop it up front.
+            liveCourseIDsDF = (spark.read.parquet(ParquetFileConstants.ACBP_SELECT_FILE)
+                               .filter(col("acbpStatus") == "Live")
+                               .select(explode(col("acbpCourseIDList")).alias("c"))
+                               .select(regexp_replace(from_json(col("c"), course_schema)["identifier"],
+                                                      course_id_regex, "").alias("courseID"))
+                               .na.drop()
+                               .distinct())
 
-            # Assignment type mapping
+            # 51 GB file: read only the columns used (the large per-content status maps are never
+            # read), and keep only enrolments in courses that are part of a Live plan.
+            enrolmentDF = (spark.read.parquet(ParquetFileConstants.ENROLMENT_COMPUTED_PARQUET_FILE)
+                           .filter(col('enrolment_status') == 'enrolled')
+                           .select("userID", "courseID", "dbCompletionStatus",
+                                   "courseCompletedTimestamp", "courseProgress")
+                           .join(broadcast(liveCourseIDsDF), ["courseID"], "left_semi"))
+
+            # Every consumer of this data only uses Live plans, so filter BEFORE the explode and
+            # the joins. Null userID/courseID rows are dropped here too (same as the old na.drop
+            # after the joins: both columns come from this side of the left joins).
+            acbpLiveDF = (spark.read.parquet(ParquetFileConstants.ACBP_COMPUTED_FILE)
+                          .filter(col("acbpStatus") == "Live")
+                          .withColumn("courseIDList", explode(col("acbpCourseIDList")))
+                          .withColumn("courseIDList", from_json(col("courseIDList"), course_schema))
+                          .withColumn("courseID", col("courseIDList.identifier"))
+                          .withColumn("isACBPMandatory", col("courseIDList.mandatory"))
+                          .withColumn("courseID", regexp_replace(col("courseID"), course_id_regex, ""))
+                          .na.drop(subset=["userID", "courseID"])
+                          .drop("acbpCourseIDList", "courseIDList"))
+
+            # Latest-due plan per user/course: computed ONCE here and stored as row_num, so the
+            # enrolment report and the user summary read the SAME chosen row.
+            window_spec = Window.partitionBy("userID", "courseID").orderBy(desc("completionDueDate"))
+
+            coreDF = (acbpLiveDF
+                      .join(broadcast(allCourseProgramDetailsDF), ["courseID"], "left")
+                      .join(enrolmentDF, ["courseID", "userID"], "left")
+                      .withColumn("row_num", row_number().over(window_spec))
+                      # Only rows an output reads: row_num = 1 (enrolment report + summary)
+                      # or isapar (APAR uses all Live isapar rows). The rest were written for nothing.
+                      .filter((col("row_num") == 1) | (col("isapar") == True))
+                      .select(*CORE_COLS, "row_num"))
+
+            # ------------------------------------------------------------------
+            # Materialise the joined data ONCE as parquet. Before, this whole
+            # pipeline (10 GB ACBP explode + 51 GB enrolment scan + join) was
+            # recomputed for every output: enrolment plain parquet, enrolment
+            # warehouse, user summary and APAR = 4 times.
+            # ------------------------------------------------------------------
+            intermediatePath = f"{config.localReportDir}/temp/acbp-report-intermediate/{today}"
+            print(f"💾 Writing ACBP x enrolment intermediate -> {intermediatePath}")
+            coreDF.write.mode("overwrite").option("compression", "snappy").parquet(intermediatePath)
+            coreDF = spark.read.parquet(intermediatePath)
+            print(f"Stage 1: Complete - joins + intermediate written (⏱ {time.time() - stage_start:.2f}s)")
+            stage_start = time.time()
+
+            # ================= CB plan warehouse (from the small acbp-select file) =================
             assignment_type_mapping = {
                 'rootorgid': 'mdo_id',
                 'user': 'user',
@@ -104,12 +167,13 @@ class ACBPModel:
 
             mapping_expr = create_map([lit(x) for x in chain(*assignment_type_mapping.items())])
 
+            # The old left join with content here was unused (no content column is selected,
+            # and dropDuplicates() below removes any fan-out), so it is dropped.
             acbpSelectEnrolmentDF = spark.read.parquet(ParquetFileConstants.ACBP_SELECT_FILE) \
                 .withColumn("courseIDList", explode(col("acbpCourseIDList"))) \
                 .withColumn("courseIDList", from_json(col("courseIDList"), course_schema)) \
                 .withColumn("courseID", col("courseIDList.identifier")) \
                 .withColumn("isACBPMandatory", col("courseIDList.mandatory")) \
-                .join(allCourseProgramDetailsDF, ["courseID"], "left") \
                 .drop("acbpCourseIDList", "courseIDList") \
                 .withColumn("assignmentTypeInfo",
                             array_join(
@@ -128,7 +192,7 @@ class ACBPModel:
                 "assignmentType", "assignmentTypeInfo", "courseID",
                 "allocatedOn", "completionDueDate", "acbpStatus", "planyear", "plantype", "isACBPMandatory"
             ) \
-                .withColumn("data_last_generated_on", lit(currentDateTime)) \
+                .withColumn("data_last_generated_on", currentDateTime) \
                 .select(
                 col("orgID").alias("org_id"),
                 col("acbpCreatedBy").alias("created_by"),
@@ -149,13 +213,8 @@ class ACBPModel:
                 .dropDuplicates() \
                 .orderBy("org_id", "created_by", "plan_name")
 
-            window_spec = Window.partitionBy("userID", "courseID").orderBy(desc("completionDueDate"))
-
-            acbpEnrolmentDF = acbpAllEnrolmentDF \
-                .where(col("acbpStatus") == "Live") \
-                .withColumn("row_num", row_number().over(window_spec)) \
-                .filter(col("row_num") == 1) \
-                .drop("row_num")
+            # ================= Enrolment report =================
+            acbpEnrolmentDF = coreDF.filter(col("row_num") == 1).drop("row_num")
 
             ministry_is_empty = (col("ministry_name").isNull()) | (col("ministry_name") == "")
             dept_is_empty = (col("dept_name").isNull()) | (col("dept_name") == "")
@@ -230,41 +289,29 @@ class ACBPModel:
                 col("plantype").alias("Plan type"),
                 col("isACBPMandatory").alias("is mandatory"),
                 col("userOrgID").alias("mdoid"),
-                lit(currentDateTime).alias("Report_Last_Generated_On")
+                currentDateTime.alias("Report_Last_Generated_On")
             ) \
                 .fillna("")
 
-            print(f"Stage 1: Complete - source data + enrolment report built (⏱ {time.time() - stage_start:.2f}s)")
-            stage_start = time.time()
-
             # ================================================================
-            # CHANGED: this job now writes PLAIN parquet only - no in-job
-            # Polars/DuckDB CSV export at all. Calling Polars from inside this
-            # Spark job (as a previous draft did) kept Spark's reserved
-            # executor/driver memory alive the whole time Polars' own
-            # partition_by() memory spike was happening - the exact
-            # contention risk already fixed for courseBasedAssessmentReport.
-            # The per-org CSV split now happens entirely in the separate,
-            # standalone polars_csv_export.py process, run AFTER this job's
-            # Spark session has fully stopped.
-            #
-            # This path is STABLE (not cleaned up by this job) - keep it in
-            # sync with the matching entry in polars_csv_export.py's
-            # get_reports() registry.
+            # Plain parquet only - the per-org CSV split happens in the
+            # separate polars_csv_export.py run after this job has stopped.
+            # This path is STABLE - keep it in sync with polars_csv_export.py.
             # ================================================================
             print("📝 Writing plain parquet for enrollment report...")
             enrolmentReportPlainPath = f"{config.localReportDir}/temp/cbp-enrolment-report-plain/{today}"
             enrolmentReportDF.write.mode("overwrite").option("compression", "snappy").parquet(enrolmentReportPlainPath)
 
-            enrolmentReportDF.write.mode("overwrite").option("compression", "snappy").parquet(
-                f"{config.warehouseReportDir}/cbp_enrollments")
+            # Warehouse copy is read back from the parquet just written instead of
+            # recomputing enrolmentReportDF a second time.
+            # Byte-for-byte file copy: no Spark read, decompress, recompress, write.
+            warehouseEnrolmentPath = f"{config.warehouseReportDir}/cbp_enrollments"
+            shutil.rmtree(warehouseEnrolmentPath, ignore_errors=True)
+            shutil.copytree(enrolmentReportPlainPath, warehouseEnrolmentPath)
             print(f"Stage 2: Complete - enrollment plain parquet + warehouse write (⏱ {time.time() - stage_start:.2f}s)")
             stage_start = time.time()
 
-            ######################################################
-            # creating data for apar enrollment report for sahil
-            #######################################################
-
+            # ================= APAR enrolment data =================
             print("📝 Start Apar enrollment report data...")
 
             kcmDF = spark.read.parquet(f"{config.warehouseReportDir}/{config.dwKcmDictionaryTable}")
@@ -300,11 +347,10 @@ class ACBPModel:
 
             print("📝 Preparing Apar enrollment report data...")
 
-            userAdditionalProperties = userOrgDF.select("userID", "externalSystem","externalSystemId")
-
-            aparEnrolmentData = acbpAllEnrolmentDF.where((col("acbpStatus") == "Live") & (col("isapar") == True)) \
+            # Same rows as before: all Live plan rows (not only row_num = 1) with isapar = true.
+            aparEnrolmentData = coreDF.where(col("isapar") == True) \
                 .join(userAdditionalProperties, "userID", "left") \
-                .join(resultDF, acbpAllEnrolmentDF.courseID == resultDF.course_id, "left") \
+                .join(resultDF, col("courseID") == resultDF.course_id, "left") \
                 .withColumn(
                 "content_duration",
                 F.when(F.col("courseDuration").isNull(), None)
@@ -343,20 +389,11 @@ class ACBPModel:
                 col("isACBPMandatory").alias("isMandatory")
             ).dropDuplicates(["user_id", "content_id"])
 
-            resultDF.unpersist()
-            kcmMappingDF.unpersist()
-            kcmDF.unpersist()
             print("✅ Apar enrollment report data prepared successfully!")
             print(f"Stage 3: Complete - Apar enrollment data prepared (⏱ {time.time() - stage_start:.2f}s)")
             stage_start = time.time()
 
-            ######################################################
-            # end of apar enrollment report for sahil
-            ######################################################
-
-            ministry_is_empty = (col("ministry_name").isNull()) | (col("ministry_name") == "")
-            dept_is_empty = (col("dept_name").isNull()) | (col("dept_name") == "")
-
+            # ================= User summary report =================
             cleanDF = acbpEnrolmentDF \
                 .filter(col("userStatus").cast("int") == 1) \
                 .withColumn(
@@ -389,7 +426,9 @@ class ACBPModel:
                 "Ministry", "Department", "Organization", "employeeCode"
             ) \
                 .agg(
-                countDistinct("courseID").alias("allocatedCount"),
+                # row_num == 1 leaves exactly one row per (userID, courseID) and userID is a group
+                # key, so a plain count equals countDistinct without the costly distinct aggregation.
+                F.count("courseID").alias("allocatedCount"),
                 spark_sum(when(col("dbCompletionStatus") == 2, 1).otherwise(0)).alias("completedCount"),
                 spark_sum(
                     when(
@@ -419,11 +458,9 @@ class ACBPModel:
                 col("completedCount").alias("Number of CBP Courses Completed"),
                 col("completedBeforeDueDateCount").alias("Number of CBP Courses Completed within due date"),
                 col("userOrgID").alias("mdoid"),
-                lit(currentDateTime).alias("Report_Last_Generated_On")
+                currentDateTime.alias("Report_Last_Generated_On")
             )
 
-            # Same reasoning as the enrollment report above - plain parquet
-            # only, CSV split handled by the separate polars_csv_export.py run.
             print("📝 Writing plain parquet for user summary report...")
             summaryReportPlainPath = f"{config.localReportDir}/temp/cbp-summary-report-plain/{today}"
             userSummaryReportDF.write.mode("overwrite").option("compression", "snappy").parquet(summaryReportPlainPath)
@@ -431,23 +468,17 @@ class ACBPModel:
             stage_start = time.time()
 
             print("📦 Writing warehouse data...")
-            # coalesce(1) removed - was forcing this write through a single
-            # task regardless of available parallelism, same validated fix
-            # as courseBasedAssessmentReport (there: 496.68s -> 27.48s).
             cbPlanWarehouseDF.write.mode("overwrite").option("compression", "snappy").parquet(
                 f"{config.warehouseReportDir}/{config.dwCBPlanTable}")
             print(f"Stage 5: Complete - cbPlanWarehouseDF written (⏱ {time.time() - stage_start:.2f}s)")
             stage_start = time.time()
-            print("✅ Processing completed successfully!")
 
             print("📝 Writing Apar enrollment parquet report for warehouse...")
-            # coalesce(1) removed here too - this was the write that showed
-            # up in Spark UI as a single task blocking 6 pending stages for
-            # 2.3+ minutes (Job 59, "0/1 (1 running)").
             aparEnrolmentData.write.mode("overwrite").option("compression", "snappy").parquet(
                 f"{config.warehouseReportDir}/{config.dwAparCBPEnrollmentTable}")
             print(f"Stage 6: Complete - aparEnrolmentData written (⏱ {time.time() - stage_start:.2f}s)")
-            print("✅ Apar enrollment parquet report written successfully!")
+
+            shutil.rmtree(intermediatePath, ignore_errors=True)
 
             total_time = time.time() - start_time
             print(f"\n✅ ACBPModel processing completed in {total_time:.2f} seconds ({total_time / 60:.1f} minutes)")
@@ -459,21 +490,16 @@ class ACBPModel:
 
 
 def main():
-    # Reverted from local-cluster back to local[*] - measured no benefit for
-    # this job (25:14 min on local[*] vs 25:08 min on local-cluster[4,8,40000],
-    # essentially unchanged). Confirms this job's bottleneck is the un-batched
-    # DuckDB path and the coalesce(1) writes, not GC/spill - same conclusion
-    # reached for dashboardSync. local-cluster's executor-isolation/GC benefit
-    # doesn't pay for its own coordination + serialization overhead when the
-    # real cost lives elsewhere.
     spark = SparkSession.builder \
         .appName("ACBP Report") \
-        .config("spark.sql.shuffle.partitions", "120") \
+        .config("spark.master", "local[*]") \
+        .config("spark.sql.shuffle.partitions", "256") \
         .config("spark.driver.memory", "120g") \
-        .config("spark.driver.memoryOverhead", "20g") \
         .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
         .config("spark.sql.adaptive.enabled", "true") \
         .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
+        .config("spark.sql.adaptive.skewJoin.enabled", "true") \
+        .config("spark.sql.autoBroadcastJoinThreshold", str(100 * 1024 * 1024)) \
         .config("spark.sql.legacy.timeParserPolicy", "LEGACY") \
         .getOrCreate()
 
@@ -485,9 +511,8 @@ def main():
     model = ACBPModel()
     model.process_data(spark, config)
     end_time = datetime.now()
-    duration = end_time - start_time
     print(f"[END] ACBPModel processing completed at: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"[INFO] Total duration: {duration}")
+    print(f"[INFO] Total duration: {end_time - start_time}")
     spark.stop()
 
 

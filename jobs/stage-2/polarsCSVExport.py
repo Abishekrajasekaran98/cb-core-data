@@ -218,6 +218,26 @@ def get_reports(today: str, config):
         "max_workers": 16,
     })
 
+    # ---- ACBP Enrolment Report ----
+    reports.append({
+        "name": "ACBP Enrolment Report",
+        "parquet_path": f"{config.localReportDir}/temp/cbp-enrolment-report-plain/{today}",
+        "output_dir": f"{config.localReportDir}/{config.acbpMdoEnrolmentReportPath}/{today}",
+        "partition_col": "mdoid",
+        "csv_filename": config.cbpEnrolmentReport,
+        "max_workers": 16,
+    })
+
+    # ---- ACBP Summary Report ----
+    reports.append({
+        "name": "ACBP Summary Report",
+        "parquet_path": f"{config.localReportDir}/temp/cbp-summary-report-plain/{today}",
+        "output_dir": f"{config.localReportDir}/{config.acbpMdoSummaryReportPath}/{today}",
+        "partition_col": "mdoid",
+        "csv_filename": config.cbpSummaryReport,
+        "max_workers": 16,
+    })
+
     # ---- Next report goes here — copy the block above and adjust paths ----
     # reports.append({
     #     "name": "...",

@@ -206,11 +206,11 @@ class CourseBasedAssessmentModel:
                 .select(
                 col("userID"),
                 col("source_id").alias("assessment_id"),
-                col("courseOrgID"),
-                col("assessChildID"),
+                col("courseID").alias("assessID"),
+                col("courseOrgID").alias("assessOrgID"),
                 col("userOrgID"),
                 col("fullName"),
-                col("userStatus"),
+                col("userStatus").alias("status"),
                 col("designation").alias("Designation"),
                 col("userPrimaryEmail").alias("E mail"),
                 col("userMobile").alias("Phone Number"),
@@ -254,7 +254,12 @@ class CourseBasedAssessmentModel:
             new_keys = fullReportNewDF.select("userID", "assessment_id", "course_id").distinct()
             old_unique_only = fullReportOldDF.join(new_keys, ["userID", "assessment_id", "course_id"], "left_anti")
 
-            fullReportDF = fullReportNewDF.union(old_unique_only)
+            _new_cols, _old_cols = fullReportNewDF.columns, old_unique_only.columns
+            if sorted(_new_cols) != sorted(_old_cols):
+                raise ValueError(f"fullReport column mismatch. new-only: {set(_new_cols) - set(_old_cols)}, "
+                                 f"old-only: {set(_old_cols) - set(_new_cols)}")
+
+            fullReportDF = fullReportNewDF.unionByName(old_unique_only)
             # Forced cache materialization: .cache() alone is lazy and never
             # populates until an action runs. Without .count() here, this
             # entire join/union lineage was being recomputed from scratch at

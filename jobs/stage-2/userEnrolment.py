@@ -567,6 +567,7 @@ class UserEnrolmentModel:
 
             print("📦 Writing warehouse data...")
             warehouseDF = platformWarehouseDF.unionByName(marketPlaceWarehouseDF).unionByName(standaloneAssessWarehouseDF)
+            warehouseDF = warehouseDF.withColumn("certificate_id",when(col("certificate_id") == "", lit(None)).otherwise(col("certificate_id")))
             warehouseDF.coalesce(1).write.mode("overwrite").option("compression", "snappy").parquet(
                 f"{config.warehouseReportDir}/{config.dwEnrollmentsTable}")
 

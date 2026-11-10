@@ -1,4 +1,4 @@
-
+#!/bin/bash
 # ===== 1. LOGGING SETUP =====
 log_file="/home/analytics/pyspark/cleanup.log"
 exec &>> "$log_file"
@@ -8,19 +8,22 @@ echo "Running script at $(date)"
 # ===== 2. REPORT TYPES DEFINITION =====
 data_reports=(
     'course-report'
-    'user-report' 
+    'user-report'
     'user-enrollment-report'
     'cba-report'
     'org-hierarchy-report'
-    'blended-program-report-cbp'  
-    'cbp-report-mdo-enrolment' 
+    'blended-program-report-cbp'
+    'cbp-report-mdo-enrolment'
     'user-assessment-report-cbp'
-    'blended-program-report-mdo' 
-    'cbp-report'  
-    'cbp-report-mdo-summary '  
+    'blended-program-report-mdo'
+    'cbp-report'
+    'cbp-report-mdo-summary'          # FIXED: had a trailing space inside the quotes, so it never matched the real folder
     'kcm-report'
+    'course-completion-survey-report' # ADDED
+    'gamification-report'             # ADDED
+    'ml-report'                       # ADDED
 )
-# 🎯 PURPOSE: Defines 6 types of analytics reports to process
+# 🎯 PURPOSE: Report folders under standalone-reports whose old dated folders get cleaned
 
 # ===== 3. DIRECTORY SETUP =====
 source_dir="/home/analytics/pyspark/reports/standalone-reports"     # Where reports are generated
@@ -31,8 +34,17 @@ source_dir="/home/analytics/pyspark/reports/standalone-reports"     # Where repo
 echo "Removing $source_dir old data"
 cd $source_dir
 
-# Calculate yesterday's date
+# Calculate today's and yesterday's date
+# (today was previously assigned further down, so the log line below printed it empty)
+today=$(date "+%Y-%m-%d")
 yesterday=$(date -d "yesterday" "+%Y-%m-%d")
+
+# ADDED: if the date ever comes back empty, the paths below would collapse to the
+# report folder itself and rm -rf would wipe the whole report type. Abort instead.
+if [ -z "$yesterday" ]; then
+    echo "ERROR: could not compute yesterday's date - aborting cleanup"
+    exit 1
+fi
 
 echo "Today: $today, Yesterday: $yesterday"
 
@@ -101,3 +113,87 @@ echo "Removing yesterdays's report from $source_dir"
 # cd /home/analytics/pyspark/logs/data-products/
 # find . -atime +2 -exec rm {} \;                         # Remove log files not accessed for 2+ days
 # # 🎯 PURPOSE: Prevent log directory from filling up disk space
+
+# ===== 12. CLEANUP WAREHOUSE FOLDERS =====
+# Deletes everything in the warehouse folder EXCEPT the .py scripts and content_health_score.
+# Names only - each entry must be a direct child of $warehouse_dir (no slashes).
+warehouse_dir="/home/analytics/pyspark/warehouse"
+warehouse_delete=(
+    'L_org_hierarchy'
+    'aiCBPFactTable'
+    'apar_cbp_enrollment'
+    'assessment_detail'
+    'bp_enrolments'
+    'cap_allocation_meta'
+    'cap_allocation_user_wise'
+    'cb_plan'
+    'cbp_enrollments'
+    'competencyMasterListTable'
+    'content'
+    'content_custom'
+    'content_resource'
+    'course_completion_survey_details'
+    'event_details'
+    'event_enrolment_details'
+    'funnelStageFactsTable'
+    'karma_dispatch'
+    'kcm'
+    'kcm_content_mapping'
+    'kcm_dictionary'
+    'learnerCoverageMapTable'
+    'mdo_enrolment_fact'
+    'mdo_org_access'
+    'mdo_user_access'
+    'mdo_user_summary'
+    'myigot_building'
+    'national_priority_mapping'
+    'nlw_mdo_leaderboard'
+    'orgDeptUserSummaryTable'
+    'org_hierarchy'
+    'org_hierarchy_new'
+    'recommendedCourseCompetencyMapTable'
+    'savedCourseMapTable'
+    'temp'
+    'unified'
+    'unified_logs'
+    'userCustomFields'
+    'user_custom_report'
+    'user_detail'
+    'user_enrolments'
+    'user_enrolments-1'
+    'user_enrolments_custom'
+)
+
+# Never delete these, even if someone adds them to the list above by mistake.
+# (.py scripts are also protected by the *.py check inside the loop.)
+warehouse_protected=(
+    'content_health_score'
+)
+
+echo "Cleaning warehouse folders under $warehouse_dir"
+for name in "${warehouse_delete[@]}"; do
+    if [ -z "$name" ] || [[ "$name" == */* ]]; then
+        echo "Skipping invalid entry: '$name'"
+        continue
+    fi
+    if [[ "$name" == *.py ]]; then
+        echo "Skipping protected script: $name"
+        continue
+    fi
+    skip=0
+    for p in "${warehouse_protected[@]}"; do
+        if [ "$name" == "$p" ]; then skip=1; fi
+    done
+    if [ "$skip" -eq 1 ]; then
+        echo "Skipping protected entry: $name"
+        continue
+    fi
+    target="$warehouse_dir/$name"
+    if [ -e "$target" ]; then
+        echo "Removing: $target"
+        rm -rf "$target"
+    else
+        echo "Not found: $target"
+    fi
+done
+# 🎯 PURPOSE: Remove warehouse folders that are no longer needed

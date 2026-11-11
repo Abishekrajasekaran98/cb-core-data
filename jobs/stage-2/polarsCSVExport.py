@@ -208,6 +208,16 @@ def get_reports(today: str, config):
         "max_workers": 16,
     })
 
+    # ---- User Enrolment Report ----
+    reports.append({
+        "name": "User Enrolment Report",
+        "parquet_path": f"{config.localReportDir}/temp/user-enrolment-report-plain/{today}",
+        "output_dir": f"{config.localReportDir}/{config.userEnrolmentReportPath}/{today}",
+        "partition_col": "mdoid",
+        "csv_filename": config.userEnrollmentReport,
+        "max_workers": 16,
+    })
+
     # ---- Next report goes here — copy the block above and adjust paths ----
     # reports.append({
     #     "name": "...",

@@ -163,7 +163,7 @@ class UserEnrolmentModel:
                 col("certificate_generated"),
                 lit(0).alias("number_of_certificate"),
                 lit("Not Available").alias("user_rating"),
-                lit("").alias("certificate_id"),
+                lit(None).cast(StringType()).alias("certificate_id"),
                 lit(False).alias("live_cbp_plan_mandate"),
                 lit(None).cast(StringType()).alias("badge_id"),
                 lit(0).cast(IntegerType()).alias("karma_points"),
@@ -403,7 +403,7 @@ class UserEnrolmentModel:
                 col("certificate_generated").alias("certificate_generated"),
                 col("issuedCertificateCount").alias("number_of_certificate"),
                 col("userRating").alias("user_rating"),
-                col("certificateID").alias("certificate_id"),
+                when(col("certificateID") == "", lit(None).cast(StringType())).otherwise(col("certificateID")).alias("certificate_id"),
                 col("live_cbp_plan_mandate"),
                 col("badge_details.badgeId").alias("badge_id"),
                 col("data_last_generated_on")
@@ -512,7 +512,7 @@ class UserEnrolmentModel:
                 col("Certificate_Generated").alias("certificate_generated"),
                 col("issuedCertificateCount").alias("number_of_certificate"),
                 col("userRating").alias("user_rating"),
-                col("Certificate_ID").alias("certificate_id"),
+                when(col("Certificate_ID") == "", lit(None).cast(StringType())).otherwise(col("Certificate_ID")).alias("certificate_id"),
                 col("live_cbp_plan_mandate"),
                 col("data_last_generated_on"),
                 col("karma_points"),
@@ -564,6 +564,7 @@ class UserEnrolmentModel:
                          concat(col("mdoid"), lit("_non_govt")))
                 .otherwise(col("mdoid")))
             reportOutDF = reportOutDF.drop("is_non_govt_user", "Roles")
+            reportOutDF = reportOutDF.select(*[c for c in reportOutDF.columns if c != "mdoid"], "mdoid")
 
             enrolmentReportPlainPath = f"{config.localReportDir}/temp/user-enrolment-report-plain/{today}"
             print(f"📝 Writing plain parquet for user enrolment report -> {enrolmentReportPlainPath}")

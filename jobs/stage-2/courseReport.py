@@ -447,42 +447,47 @@ class CourseReportModel:
 
 
 def main():
-    config_dict = get_environment_config()
-    config = create_config(config_dict)
-    os.environ['PYSPARK_SUBMIT_ARGS'] = '--packages org.elasticsearch:elasticsearch-spark-30_2.12:8.11.0 pyspark-shell'
+    try:
+        config_dict = get_environment_config()
+        config = create_config(config_dict)
+        os.environ['PYSPARK_SUBMIT_ARGS'] = '--packages org.elasticsearch:elasticsearch-spark-30_2.12:8.11.0 pyspark-shell'
 
-    # CHANGED: local-cluster instead of implicit local[*]/single-JVM default,
-    # matching the validated fix from courseBasedAssessmentReport - real
-    # executor isolation avoids single-JVM GC stalls. Adjust worker
-    # count/memory to this machine's actual cores/RAM if different from the
-    # 32-core/252GB box used in that job.
-    spark = SparkSession.builder \
-        .appName("Course Report Model") \
-        .master("local-cluster[4, 8, 38000]") \
-        .config("spark.executor.memory", "36g") \
-        .config("spark.driver.memory", "16g") \
-        .config("spark.sql.shuffle.partitions", "128") \
-        .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
-        .config("spark.sql.adaptive.enabled", "true") \
-        .config("spark.sql.adaptive.skewJoin.enabled", "true") \
-        .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
-        .config("spark.sql.legacy.timeParserPolicy", "LEGACY") \
-        .config("es.nodes", config.sparkElasticsearchConnectionHost) \
-        .config("es.port", config.sparkElasticsearchConnectionPort) \
-        .config("es.index.auto.create", "false") \
-        .config("es.nodes.wan.only", "true") \
-        .config("es.nodes.discovery", "false") \
-        .getOrCreate()
+        # CHANGED: local-cluster instead of implicit local[*]/single-JVM default,
+        # matching the validated fix from courseBasedAssessmentReport - real
+        # executor isolation avoids single-JVM GC stalls. Adjust worker
+        # count/memory to this machine's actual cores/RAM if different from the
+        # 32-core/252GB box used in that job.
+        spark = SparkSession.builder \
+            .appName("Course Report Model") \
+            .master("local-cluster[4, 8, 38000]") \
+            .config("spark.executor.memory", "36g") \
+            .config("spark.driver.memory", "16g") \
+            .config("spark.sql.shuffle.partitions", "128") \
+            .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
+            .config("spark.sql.adaptive.enabled", "true") \
+            .config("spark.sql.adaptive.skewJoin.enabled", "true") \
+            .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
+            .config("spark.sql.legacy.timeParserPolicy", "LEGACY") \
+            .config("es.nodes", config.sparkElasticsearchConnectionHost) \
+            .config("es.port", config.sparkElasticsearchConnectionPort) \
+            .config("es.index.auto.create", "false") \
+            .config("es.nodes.wan.only", "true") \
+            .config("es.nodes.discovery", "false") \
+            .getOrCreate()
 
-    start_time = datetime.now()
-    print(f"[START] CourseReportModel processing started at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    model = CourseReportModel()
-    model.process_data(spark, config)
-    end_time = datetime.now()
-    duration = end_time - start_time
-    print(f"[END] CourseReportModel processing completed at: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"[INFO] Total duration: {duration}")
-    spark.stop()
+        start_time = datetime.now()
+        print(f"[START] CourseReportModel processing started at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        model = CourseReportModel()
+        model.process_data(spark, config)
+        end_time = datetime.now()
+        duration = end_time - start_time
+        print(f"[END] CourseReportModel processing completed at: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"[INFO] Total duration: {duration}")
+    except Exception as e:
+        print(f"[ERROR] CourseReport job failed: {e}")
+        raise
+    finally:
+        spark.stop()
 
 
 if __name__ == "__main__":

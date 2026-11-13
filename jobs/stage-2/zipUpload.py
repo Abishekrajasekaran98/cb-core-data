@@ -20,6 +20,7 @@ import os
 import pandas as pd
 import pyzipper
 import pyminizip
+import polars as pl
 
 sys.path.append(str(Path(__file__).resolve().parents[2]))
 
@@ -28,8 +29,7 @@ from dfutil.user import userDFUtil
 from dfutil.enrolment import enrolmentDFUtil
 from dfutil.content import contentDFUtil
 from dfutil.dfexport import dfexportutil
-from dfutil.utils.utils import sync_reports
-from dfutil.utils.utils import sync_reports_splat
+from dfutil.utils.utils import sync_reports_parallel, sync_reports_splat, zip_folders_parallel
 from jobs.config import get_environment_config
 from jobs.default_config import create_config
 from dfutil.utils.redis import Redis
@@ -81,10 +81,10 @@ class ZipUploadModel:
         ministry_ids = [
             row["ministry_id"]
             for row in org_hierarchy_df
-            .select("ministry_id")
-            .filter(F.col("ministry_id").isNotNull() & (F.col("ministry_id") != ""))
-            .distinct()
-            .collect()
+                .select("ministry_id")
+                .filter(F.col("ministry_id").isNotNull() & (F.col("ministry_id") != ""))
+                .distinct()
+                .collect()
         ]
         ministry_password_map = {
             mid: ZipUploadModel.generate_alphanumeric_password(config.password_length)
@@ -97,14 +97,14 @@ class ZipUploadModel:
         orphan_dept_ids = [
             row["department_id"]
             for row in org_hierarchy_df
-            .select("department_id")
-            .filter(
-                (F.col("ministry_id").isNull() | (F.col("ministry_id") == "")) &
-                F.col("department_id").isNotNull() &
-                (F.col("department_id") != "")
-            )
-            .distinct()
-            .collect()
+                .select("department_id")
+                .filter(
+                    (F.col("ministry_id").isNull() | (F.col("ministry_id") == "")) &
+                    F.col("department_id").isNotNull() &
+                    (F.col("department_id") != "")
+                )
+                .distinct()
+                .collect()
         ]
         dept_password_map = {
             did: ZipUploadModel.generate_alphanumeric_password(config.password_length)
@@ -162,6 +162,61 @@ class ZipUploadModel:
         password_df = spark.createDataFrame(rows, schema=schema)
 
         return mdoid_password_map, password_df
+    
+    def run_full_report(self, config):
+        """Part 2: zip the selected warehouse parquet folders with 7z and upload the zip. Returns the seconds it took."""
+        part2_start          = time.time()
+        warehouse_base       = config.warehouseReportDir
+        warehouse_output_dir = config.warehouseOutputDir
+        warehouse_zip_path   = os.path.join(warehouse_output_dir, "reports.zip")
+
+        # only these warehouse folders go into the zip
+        SELECTED_FOLDERS = ["user_detail", "user_enrolments", "content", "content_resource",
+            "cb_plan", "org_hierarchy_new", "assessment_detail", "bp_enrolments", "event_details",
+            "event_enrolment_details", "kcm_content_mapping", "kcm_dictionary"]
+
+        if os.path.exists(warehouse_output_dir):
+            shutil.rmtree(warehouse_output_dir)
+        os.makedirs(warehouse_output_dir)
+
+        available = {f for f in os.listdir(warehouse_base)
+                     if os.path.isdir(os.path.join(warehouse_base, f))}
+        folders = [f for f in SELECTED_FOLDERS if f in available]
+        missing = [f for f in SELECTED_FOLDERS if f not in available]
+        if missing:
+            print(f"⚠️  [Part 2] Not found in {warehouse_base}, skipping: {missing}")
+
+        if folders:
+            print(f"\n🗜️  [Part 2] Zipping {len(folders)} parquet folders: {folders}")
+            zip_start = time.time()
+            try:
+                subprocess.run(
+                    ["7z", "a", "-tzip", "-mx=0", "-mmt=on",
+                     f"-p{config.password}", "-mem=ZipCrypto",
+                     warehouse_zip_path, *folders,
+                     "-xr!_SUCCESS", "-xr!*.crc"],
+                    cwd=warehouse_base, check=True, stdout=subprocess.DEVNULL,
+                )
+            except subprocess.CalledProcessError as e:
+                # the exception text contains the whole command line, i.e. the password
+                raise RuntimeError(f"7z failed with exit code {e.returncode} while zipping {folders}") from None
+            size_gb = os.path.getsize(warehouse_zip_path) / 1e9
+            print(f"✅ [Part 2] Zipped at: {warehouse_zip_path} ({size_gb:.2f} GB)")
+            print(f"⏱️  [Part 2] Zipping completed in {time.time() - zip_start:.2f}s")
+
+            print("\n📤 [Part 2] Syncing warehouse reports to cloud...")
+            sync_start = time.time()
+            sync_reports_splat(warehouse_zip_path, config.fullReportSyncPath, config)
+            print(f"⏱️  [Part 2] Sync completed in {time.time() - sync_start:.2f}s")
+            # only reached if the sync succeeded
+            os.remove(warehouse_zip_path)
+            print(f"🗑️  [Part 2] Deleted local zip {warehouse_zip_path}")
+        else:
+            print("⚠️  [Part 2] None of the selected folders exist - nothing to zip")
+
+        elapsed = time.time() - part2_start
+        print(f"\n⏱️  Part 2 completed in {elapsed:.2f}s")
+        return elapsed
 
     def upload_parquet_files(self, config):
         try:
@@ -184,7 +239,7 @@ class ZipUploadModel:
                 print(f"WARNING: File not found: {org_hierarchy_file}")
 
             if user_details_exists and enrolments_exists and org_hierarchy_exists:
-                sync_reports(base_path, config.unifiedParquetPath, config)
+                sync_reports_parallel(base_path, config.unifiedParquetPath, config)
                 print("Completed uploading Parquet files to GCP bucket.")
             else:
                 print("Upload skipped: One or more required files are missing.")
@@ -222,8 +277,7 @@ class ZipUploadModel:
                 return f"✗ Failed {mdoid_folder}: {str(e)}"
         return None
 
-    # This method was written for splat upload where the csvs was requested. Its no longer used and hence commented.
-    '''@staticmethod
+    @staticmethod
     def convert_parquet_to_csv_splat(task):
         folder, warehouse_base, warehouse_output_dir = task
         src = os.path.join(warehouse_base, folder)
@@ -243,7 +297,41 @@ class ZipUploadModel:
         if fixes:
             lf = lf.with_columns(fixes)
         lf.sink_csv(out)          # single CSV, streamed
-        return f"✅ {folder} -> {out}"'''
+        return f"✅ {folder} -> {out}"
+    @staticmethod
+    def convert_parquet_to_csv(args):
+        """
+        Convert a parquet folder to a single CSV using pandas,
+        reading one parquet file at a time to avoid OOM.
+        """
+        folder, warehouse_base, warehouse_output_dir = args
+        folder_path = os.path.join(warehouse_base, folder)
+
+        if not os.path.isdir(folder_path):
+            return None
+
+        parquet_files = [f for f in os.listdir(folder_path) if f.endswith(".parquet")]
+        if not parquet_files:
+            return None
+
+        csv_output = os.path.join(warehouse_output_dir, f"{folder}.csv")
+
+        try:
+            first = True
+            for pf in parquet_files:
+                full_path = os.path.join(folder_path, pf)
+                df = pd.read_parquet(full_path)
+                df.to_csv(
+                    csv_output,
+                    index=False,
+                    mode="w" if first else "a",
+                    header=first,
+                )
+                del df
+                first = False
+            return f"✓ Converted {folder}"
+        except Exception as e:
+            return f"✗ Error processing {folder}: {str(e)}"
 
     @staticmethod
     def copy_file_to_mdoid(args):
@@ -251,8 +339,14 @@ class ZipUploadModel:
         try:
             os.makedirs(dest_dir, exist_ok=True)
             dest_path = os.path.join(dest_dir, dest_filename)
-            shutil.copy2(source_file, dest_path)
-            return True
+            if os.path.lexists(dest_path):              # same overwrite behaviour as copy2
+                os.remove(dest_path)
+            try:
+                os.link(source_file, dest_path)         # hardlink: instant, no data is copied
+                return "linked"
+            except OSError:                             # other filesystem / links not allowed -> real copy
+                shutil.copy2(source_file, dest_path)
+                return "copied"
         except Exception as e:
             print(f"Error copying {source_file}: {e}")
             return False
@@ -273,6 +367,12 @@ class ZipUploadModel:
                 f"{config.warehouseReportDir}/{config.dwOrgTable}"
             ).select("mdo_id", "ministry_id", "department_id").cache()
             print(f"  Org hierarchy rows: {org_hierarchy_df.count()}")
+            def _timed_parquet_upload():
+                t = time.time()
+                self.upload_parquet_files(config)
+                return time.time() - t
+            parquet_pool   = ThreadPoolExecutor(max_workers=1)
+            parquet_future = parquet_pool.submit(_timed_parquet_upload)
 
             # ------------------ Part 1: Merge & Zip MDOID Reports ------------- #
             part1_start = time.time()
@@ -303,7 +403,7 @@ class ZipUploadModel:
                 if os.path.exists(cbp_dir):
                     print(f"  → Syncing: {cbp_dir}")
                     try:
-                        sync_reports(cbp_dir, os.path.join(config.prefixDirectoryPath, subfolder, today_date), config)
+                        sync_reports_parallel(cbp_dir, os.path.join(config.prefixDirectoryPath, subfolder, today_date), config)
                     except Exception as e:
                         print(f"✗ Failed syncing CBP folder {subfolder}: {e}")
                 else:
@@ -345,8 +445,8 @@ class ZipUploadModel:
                 print(f"  Copying files in parallel (max_workers=16)...")
                 copy_start = time.time()
                 with ThreadPoolExecutor(max_workers=16) as executor:
-                    list(executor.map(self.copy_file_to_mdoid, copy_tasks))
-                print(f"⏱️  File copying completed in {time.time() - copy_start:.2f}s")
+                    results = list(executor.map(self.copy_file_to_mdoid, copy_tasks))
+                print(f"linked {results.count('linked'):,}, copied {results.count('copied'):,}, failed {results.count(False):,}")
 
             print(f"Copying of mdoid folders completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -388,96 +488,46 @@ class ZipUploadModel:
                 for folder in mdoid_folders
                 if folder in mdoid_password_map
             ]
-
-            with ThreadPoolExecutor(max_workers=12) as executor:
-                futures = [executor.submit(self.zip_mdoid_folder, task) for task in zip_tasks]
-                for future in as_completed(futures):
-                    result = future.result()
-                    if result:
-                        print(f"  {result}")
-
+            zip_folders_parallel(zip_tasks)
             print(f"✅ All MDOID folders zipped with L0-grouped passwords at: {merged_dir}")
             print(f"⏱️  Zipping completed in {time.time() - zip_start:.2f}s")
             print(f"Zipping of operational reports completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
             print("\n📤 Syncing MDOID reports to cloud...")
             mdoid_sync_start = time.time()
-            sync_reports(merged_dir, config.mdoReportSyncPath, config)
+            sync_reports_parallel(merged_dir, config.mdoReportSyncPath, config)
             print(f"⏱️  MDOID sync completed in {time.time() - mdoid_sync_start:.2f}s")
 
             print(f"\n📤 Syncing KCM file separately to: {config.kcmSyncPath}")
             try:
                 kcm_sync_start = time.time()
-                sync_reports(kcm_file, config.kcmSyncPath, config)
+                sync_reports_parallel(kcm_file, config.kcmSyncPath, config)
                 print(f"⏱️  KCM sync completed in {time.time() - kcm_sync_start:.2f}s")
             except Exception as e:
                 print(f"⚠️ WARNING: Failed to sync KCM file separately: {e}")
 
             print(f"\n⏱️  Part 1 completed in {time.time() - part1_start:.2f}s")
 
-            print("\n📤 Uploading unified Parquet files...")
-            parquet_upload_start = time.time()
-            self.upload_parquet_files(config)
-            print(f"⏱️  Parquet upload completed in {time.time() - parquet_upload_start:.2f}s")
-
+            print("\n📤 Waiting for the unified Parquet upload (started in the background)...")
+            wait_start = time.time()
+            upload_seconds = parquet_future.result()    # re-raises if the upload failed, so the job still fails
+            parquet_pool.shutdown()
+            print(f"⏱️  Parquet upload completed in {upload_seconds:.2f}s (background); main thread waited {time.time() - wait_start:.2f}s")
+            part2_pool   = ThreadPoolExecutor(max_workers=1)
+            part2_future = part2_pool.submit(self.run_full_report, config) if config.createFullReport else None
             # ── Unpersist ──────────────────────────────────────────────────────
             org_hierarchy_df.unpersist()
 
-            # ------------------ Part 2: Convert Parquet to CSV & Zip ---------- #
-
-            if config.createFullReport:
-                part2_start = time. Time()
-                warehouse_base       = config.warehouseReportDir
-                warehouse_output_dir = config.warehouseOutputDir
-                warehouse_zip_path   = os.path.join(warehouse_output_dir, "reports.zip")
-
-                # only these warehouse folders go into the zip
-                SELECTED_FOLDERS = ["user_detail", "user_enrolments", "content", "content_resource",
-                                    "cb_plan", "org_hierarchy_new", "assessment_detail", "bp_enrolments", "event_details",
-                                    "event_enrolment_details", "kcm_content_mapping", "kcm_dictionary"]
-
-                if os.path.exists(warehouse_output_dir):
-                    shutil.rmtree(warehouse_output_dir)
-                os.makedirs(warehouse_output_dir)
-
-                available = {f for f in os.listdir(warehouse_base)
-                             if os.path.isdir(os.path.join(warehouse_base, f))}
-                folders = [f for f in SELECTED_FOLDERS if f in available]
-                missing = [f for f in SELECTED_FOLDERS if f not in available]
-                if missing:
-                    print(f"⚠️  Not found in {warehouse_base}, skipping: {missing}")
-
-                if folders:
-                    print(f"\n🗜️  Zipping {len(folders)} parquet folders: {folders}")
-                    zip_start = time.time()
-                    # 7z: real password protection (ZipCrypto opens on Windows/Mac/Linux built-in tools),
-                    # -mx=0 = store only (parquet is already compressed, so this is much faster),
-                    # skip Spark's _SUCCESS / .crc files
-                    subprocess.run(
-                        ["7z", "a", "-tzip", "-mx=0", "-mmt=on",
-                         f"-p{config.password}", "-mem=ZipCrypto",
-                         warehouse_zip_path, *folders,
-                         "-xr!_SUCCESS", "-xr!*.crc"],
-                        cwd=warehouse_base, check=True, stdout=subprocess.DEVNULL,
-                    )
-                    size_gb = os.path.getsize(warehouse_zip_path) / 1e9
-                    print(f"✅ Zipped at: {warehouse_zip_path} ({size_gb:.2f} GB)")
-                    print(f"⏱️  Zipping completed in {time.time() - zip_start:.2f}s")
-                    print("\n📤 Syncing warehouse reports to cloud...")
-                    sync_start = time.time()
-                    sync_reports_splat(warehouse_zip_path, config.fullReportSyncPath, config)
-                    print(f"⏱️  Sync completed in {time.time() - sync_start:.2f}s")
-                    # only reached if the sync succeeded
-                    os.remove(warehouse_zip_path)
-                    print(f"🗑️  Deleted local zip {warehouse_zip_path}")
-                else:
-                    print("⚠️  None of the selected folders exist - nothing to zip")
-
-                print(f"\n⏱️  Part 2 completed in {time.time() - part2_start:.2f}s")
+            
+            if part2_future is not None:
+                print("\n⏳ Waiting for Part 2 (full report, started in the background)...")
+                wait_start = time.time()
+                part2_seconds = part2_future.result()     # re-raises if Part 2 failed, so the job still fails
+                print(f"⏱️  Part 2 took {part2_seconds:.2f}s (background); main thread waited {time.time() - wait_start:.2f}s")
             else:
-                print("\n" + "=" * 70)
                 print("PART 2: SKIPPED (createFullReport flag is disabled)")
-                print("=" * 70)
+            part2_pool.shutdown()
+
 
         except Exception as e:
             print(f"✗ Error: {str(e)}")

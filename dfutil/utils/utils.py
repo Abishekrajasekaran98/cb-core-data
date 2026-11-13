@@ -17,6 +17,11 @@ from kafka import KafkaProducer
 import boto3
 from botocore.config import Config
 from boto3.s3.transfer import TransferConfig
+import multiprocessing
+import posixpath
+import threading
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 def druidDFOption(query: str, host: str, result_format: str = "object", limit: int = 10000,
                   spark: SparkSession = None) -> Optional[DataFrame]:
@@ -186,6 +191,270 @@ def sync_reports_splat(local_path, remote_path, config):
                 print(f"✅ Synced: {local_file_path} → gs://{config.splatGcpBucket}/{gcs_blob_path}")
 
     print(f"REPORT: Finished syncing reports from {local_path} to gs://{config.splatGcpBucket}/{remote_path}")
+
+_GCS_CLIENTS = {}
+_GCS_CLIENTS_LOCK = threading.Lock()
+
+
+def _get_gcs_client(config, pool_size):
+    """
+    Return one cached storage.Client per credentials file.
+    Building a client per call (as sync_reports does) repeats the auth set-up
+    for every folder that is uploaded.
+    """
+    key = config.googleServiceAccountFilePath
+    with _GCS_CLIENTS_LOCK:
+        client = _GCS_CLIENTS.get(key)
+        if client is None:
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key
+            client = storage.Client()
+            # requests keeps only 10 pooled connections by default; with more
+            # upload threads than that, extra connections are opened and thrown
+            # away on every request. Widen the pool to match the thread count.
+            try:
+                from requests.adapters import HTTPAdapter
+                adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
+                client._http.mount("https://", adapter)
+            except Exception as e:  # tuning only: never let it break an upload
+                print(f"WARNING: could not widen the GCS connection pool ({e}); continuing with defaults")
+            _GCS_CLIENTS[key] = client
+        return client
+
+
+def _collect_upload_files(local_path, remote_path):
+    """Return [(local_file, blob_name)] using the same naming rule as sync_reports."""
+    if os.path.isfile(local_path):
+        return [(local_path, posixpath.join(remote_path, os.path.basename(local_path)))]
+
+    files = []
+    for root, _, names in os.walk(local_path):
+        for name in names:
+            local_file = os.path.join(root, name)
+            relative = os.path.relpath(local_file, local_path).replace("\\", "/")
+            files.append((local_file, posixpath.join(remote_path, relative)))
+    return files
+
+
+def sync_reports_parallel(local_path, remote_path, config, max_workers=32, retries=2,
+                          chunk_size=2000, _uploader=None, _bucket=None):
+    """
+    Parallel replacement for sync_reports: upload a file, or every file under a
+    directory, to gs://<config.gcpBucket>/<remote_path>.
+
+    Same as sync_reports:
+      * identical object names, in file and directory mode
+      * raises if any file cannot be uploaded
+
+    Different:
+      * uploads run in `max_workers` threads (the work is network wait, so
+        threads scale; PROCESS workers are avoided on purpose because they
+        fork, which is unsafe in a process that hosts a Spark JVM)
+      * one cached client per credentials file
+      * each failed file is retried `retries` times, then ALL remaining
+        failures are reported in one RuntimeError (not just the first)
+      * a progress line per `chunk_size` files instead of one print per file
+
+    Files are submitted in batches of `chunk_size`, and each batch waits for its
+    slowest file, so one stalled upload can hold up a batch.
+
+    `_uploader` and `_bucket` are test hooks; leave them unset in real code.
+    """
+    from google.cloud.storage import transfer_manager  # lazy: keeps older client versions importable
+
+    print(f"REPORT: Syncing reports from {local_path} to gs://{config.gcpBucket}/{remote_path} "
+          f"({max_workers} threads) ...")
+    t0 = time.time()
+
+    files = _collect_upload_files(local_path, remote_path)
+    if not files:
+        print(f"REPORT: nothing to upload under {local_path}")
+        return 0
+
+    bucket = _bucket if _bucket is not None else _get_gcs_client(config, max_workers).bucket(config.gcpBucket)
+    uploader = _uploader or transfer_manager.upload_many
+
+    pending = files
+    for attempt in range(retries + 1):
+        failed = []
+        for start in range(0, len(pending), chunk_size):
+            batch = pending[start:start + chunk_size]
+            pairs = [(local_file, bucket.blob(blob_name)) for local_file, blob_name in batch]
+            results = uploader(
+                pairs,
+                worker_type=transfer_manager.THREAD,
+                max_workers=max_workers,
+                raise_exception=False,
+            )
+            for item, result in zip(batch, results):
+                if isinstance(result, Exception):
+                    failed.append((item, result))
+            if len(pending) > chunk_size:
+                done = min(start + chunk_size, len(pending))
+                print(f"   ... {done:,}/{len(pending):,} files attempted "
+                      f"({len(failed)} failed so far, {time.time() - t0:.0f}s)")
+
+        if not failed:
+            break
+        pending = [item for item, _ in failed]
+        if attempt < retries:
+            print(f"WARNING: {len(failed)} upload(s) failed, retrying ({attempt + 1}/{retries}) ...")
+            time.sleep(2 * (attempt + 1))
+
+    if failed:
+        sample = "; ".join(f"{item[1]}: {type(err).__name__}: {err}" for item, err in failed[:5])
+        raise RuntimeError(
+            f"{len(failed)} of {len(files)} files failed to upload to "
+            f"gs://{config.gcpBucket}/{remote_path} after {retries} retries. First failures: {sample}"
+        )
+
+    elapsed = time.time() - t0
+    print(f"REPORT: Finished syncing {len(files):,} files from {local_path} to "
+          f"gs://{config.gcpBucket}/{remote_path} in {elapsed:.1f}s ({len(files) / max(elapsed, 0.001):.0f} files/s)")
+    return len(files)
+
+
+def _zip_worker(args):
+    """
+    Runs inside a worker process. Returns (status, folder, n_files, seconds, message).
+    Must stay a module-level function: spawned workers locate it by import path.
+    """
+    import pyminizip  # lazy: only zip jobs need it, and only the workers
+
+    mdoid_folder, merged_dir, password, level = args
+    t0 = time.time()
+    mdoid_path = os.path.join(merged_dir, mdoid_folder)
+
+    if not os.path.isdir(mdoid_path):
+        return ("skip", mdoid_folder, 0, 0.0, "not a directory")
+    csv_files = [f for f in os.listdir(mdoid_path) if f.endswith(".csv")]
+    if not csv_files:
+        return ("skip", mdoid_folder, 0, 0.0, "no csv files")
+
+    zip_path = os.path.join(mdoid_path, "reports.zip")
+    file_paths = [os.path.join(mdoid_path, f) for f in csv_files]
+    try:
+        pyminizip.compress_multiple(file_paths, [""] * len(file_paths), zip_path, str(password), level)
+        # never delete the source CSVs unless the zip is really there
+        if not os.path.isfile(zip_path) or os.path.getsize(zip_path) == 0:
+            raise RuntimeError("zip is missing or empty after compress")
+        for p in file_paths:
+            os.remove(p)
+        return ("ok", mdoid_folder, len(csv_files), time.time() - t0, "")
+    except Exception as e:
+        return ("fail", mdoid_folder, len(csv_files), time.time() - t0, f"{type(e).__name__}: {e}")
+
+
+def _csv_bytes(task):
+    """Total size of the .csv files in one (folder, merged_dir, password) task."""
+    folder, merged_dir, _ = task
+    total = 0
+    try:
+        with os.scandir(os.path.join(merged_dir, folder)) as it:
+            for entry in it:
+                if entry.name.endswith(".csv"):
+                    total += entry.stat().st_size
+    except OSError:
+        pass
+    return total
+
+
+def zip_folders_parallel(tasks, workers=None, level=5, progress_every=2000,
+                         big_folder_bytes=None, big_level=None, show_slowest=5):
+    """
+    Zip many folders in parallel: each folder's CSVs become <folder>/reports.zip
+    (pyminizip, password protected) and the CSVs are removed.
+
+    tasks: iterable of (mdoid_folder, merged_dir, password)
+    workers: processes to use (default: CPU count, capped at 24)
+    level: compression level (1-9)
+    big_folder_bytes / big_level: optionally use a lower level for folders whose
+        CSVs total at least big_folder_bytes (default: every folder uses `level`)
+
+    Why processes: pyminizip holds the GIL for the whole call, so threads would
+    run one zip at a time. Workers start with the 'spawn' method (fork is unsafe
+    next to a live Spark JVM), so the calling script must keep its
+    `if __name__ == "__main__":` guard: spawned workers import it again.
+
+    Biggest folders are submitted first so one huge folder is not left running
+    alone at the end, and completions are reported as they happen.
+
+    Raises RuntimeError if any folder failed or any .csv was left behind, so a
+    caller never goes on to upload plaintext reports. Returns a summary dict.
+    """
+    tasks = list(tasks)
+    if not tasks:
+        print("   nothing to zip")
+        return {"zipped": 0, "skipped": 0, "failed": 0, "seconds": 0.0, "slowest_seconds": 0.0}
+
+    if workers is None:
+        workers = max(1, min(os.cpu_count() or 4, 24))
+
+    t0 = time.time()
+    sized = sorted(((task, _csv_bytes(task)) for task in tasks), key=lambda item: item[1], reverse=True)
+    sizes = {task[0]: nbytes for task, nbytes in sized}
+    work = []
+    for (folder, merged_dir, password), nbytes in sized:
+        use_level = big_level if (big_level is not None and big_folder_bytes is not None
+                                  and nbytes >= big_folder_bytes) else level
+        work.append((folder, merged_dir, password, use_level))
+    n_low = sum(1 for w in work if w[3] != level)
+    print(f"   zipping {len(work):,} folders with {workers} processes "
+          f"(biggest first, sized in {time.time() - t0:.1f}s"
+          f"{f', {n_low} giant folder(s) at level {big_level}' if n_low else ''})")
+
+    zipped = skipped = done = 0
+    failures = []
+    timings = []
+    t_zip = time.time()
+    ctx = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as executor:
+        futures = [executor.submit(_zip_worker, w) for w in work]
+        for future in as_completed(futures):
+            status, folder, _n, secs, message = future.result()
+            done += 1
+            if status == "ok":
+                zipped += 1
+                timings.append((secs, folder))
+            elif status == "skip":
+                skipped += 1
+            else:
+                failures.append((folder, message))
+            if progress_every and done % progress_every == 0:
+                print(f"   ... {done:,}/{len(work):,} folders ({time.time() - t_zip:.1f}s, {len(failures)} failed)")
+
+    leftovers = []
+    for folder, merged_dir, _ in tasks:
+        try:
+            if any(name.endswith(".csv") for name in os.listdir(os.path.join(merged_dir, folder))):
+                leftovers.append(folder)
+        except OSError:
+            pass
+
+    elapsed = time.time() - t_zip
+    print(f"   zipped {zipped:,} folders ({skipped} skipped, {len(failures)} failed) in {elapsed:.1f}s "
+          f"with {workers} processes ({zipped / max(elapsed, 0.001):.1f} zips/s)")
+
+    timings.sort(reverse=True)
+    slowest = timings[0][0] if timings else 0.0
+    if show_slowest and timings:
+        print(f"   slowest {min(show_slowest, len(timings))} folders (critical path):")
+        for secs, folder in timings[:show_slowest]:
+            print(f"      {folder}: {secs:,.1f}s for {sizes.get(folder, 0) / 1e6:,.0f} MB of CSV")
+        if workers > 1 and slowest > 0.7 * elapsed:
+            print(f"   NOTE: the single slowest folder took {slowest:,.0f}s of the {elapsed:,.0f}s wall time: "
+                  f"more workers cannot help; use big_folder_bytes/big_level for the giant folders")
+
+    if failures or leftovers:
+        sample = "; ".join(f"{f}: {m}" for f, m in failures[:5])
+        raise RuntimeError(
+            f"Zipping did not complete cleanly: {len(failures)} folder(s) failed, "
+            f"{len(leftovers)} folder(s) still contain plaintext .csv files. "
+            f"Do NOT sync merged_dir. First failures: {sample or 'n/a'}; "
+            f"folders with leftover csv: {leftovers[:5]}"
+        )
+
+    return {"zipped": zipped, "skipped": skipped, "failed": 0, "seconds": elapsed, "slowest_seconds": slowest}
+
 
 def zip_and_sync_reports(complete_path: str, report_path: str,config):
     """

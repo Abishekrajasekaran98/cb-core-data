@@ -542,18 +542,22 @@ def main():
         .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
         .config("spark.sql.legacy.timeParserPolicy", "LEGACY") \
         .getOrCreate()
-
-    start_time = datetime.now()
-    print(f"[START] Course based assessment processing started at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    config_dict = get_environment_config()
-    config = create_config(config_dict)
-    model = CourseBasedAssessmentModel()
-    model.process_data(spark, config)
-    end_time = datetime.now()
-    duration = end_time - start_time
-    print(f"[END] Course based assessment completed at: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"[INFO] Total duration: {duration}")
-    spark.stop()
+    try:
+        start_time = datetime.now()
+        print(f"[START] Course based assessment processing started at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        config_dict = get_environment_config()
+        config = create_config(config_dict)
+        model = CourseBasedAssessmentModel()
+        model.process_data(spark, config)
+        end_time = datetime.now()
+        duration = end_time - start_time
+        print(f"[END] Course based assessment completed at: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"[INFO] Total duration: {duration}")
+    except Exception as e:
+        print(f"[ERROR] Course based assessment job failed: {e}")
+        raise
+    finally:
+        spark.stop()
 
 
 if __name__ == "__main__":

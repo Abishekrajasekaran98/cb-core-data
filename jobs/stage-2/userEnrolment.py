@@ -575,7 +575,8 @@ class UserEnrolmentModel:
             print("📦 Writing warehouse data...")
             t0 = time.time()
             warehouseDF = platformWarehouseDF.unionByName(marketPlaceWarehouseDF).unionByName(standaloneAssessWarehouseDF)
-            warehouseDF.write.mode("overwrite").option("compression", "snappy").parquet(
+            warehouseDF = warehouseDF.withColumn("certificate_id",when(col("certificate_id") == "", lit(None)).otherwise(col("certificate_id")))
+            warehouseDF.coalesce(1).write.mode("overwrite").option("compression", "snappy").parquet(
                 f"{config.warehouseReportDir}/{config.dwEnrollmentsTable}")
             print(f"⏱️  Warehouse write: {time.time() - t0:.1f}s")
             shutil.rmtree(platformIntermediatePath, ignore_errors=True)

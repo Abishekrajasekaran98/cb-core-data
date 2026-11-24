@@ -551,7 +551,7 @@ def preComputeContentWarehouseData(spark):
         # Combine Platform and Marketplace Data & Write to Warehouse
         print("Writing content warehouse data...")
         df_warehouse = platformContentWarehouseDF.union(marketPlaceContentWarehouseDF)
-        exportDFToParquet(df_warehouse.coalesce(1), ParquetFileConstants.CONTENT_WAREHOUSE_COMPUTED_PARQUET_FILE)
+        exportDFToParquet(df_warehouse, ParquetFileConstants.CONTENT_WAREHOUSE_COMPUTED_PARQUET_FILE)
 
     except Exception as e:
         print(f"Content warehouse data generation error: {str(e)}")
@@ -572,7 +572,7 @@ def writeWarehouseParquetFiles(spark, config):
         org_hierarchy = spark.read.parquet(f"{output_path}/orgHierarchy") \
             .withColumn("mdo_created_on", to_date(col("mdo_created_on")).cast("string"))
         
-        org_hierarchy.coalesce(1).write.mode("overwrite").option("compression", "snappy").parquet(
+        org_hierarchy.write.mode("overwrite").option("compression", "snappy").parquet(
             f"{warehouse_path}/{config.dwOrgTable}")
         print(f"✓ Written: {warehouse_path}/{config.dwOrgTable}")
         
@@ -588,7 +588,7 @@ def writeWarehouseParquetFiles(spark, config):
     )
  
         
-        events.coalesce(1).write.mode("overwrite").option("compression", "snappy").parquet(
+        events.write.mode("overwrite").option("compression", "snappy").parquet(
             f"{warehouse_path}/event_details")
         print(f"✓ Written: {warehouse_path}/event_details")
         
@@ -606,7 +606,7 @@ def writeWarehouseParquetFiles(spark, config):
         
         eventsEnrolmentDataDFWithKarmaPoints = eventEnrolmentsDF.join(karmaPointsData, ["user_id", "event_id"], "left")
         
-        eventsEnrolmentDataDFWithKarmaPoints.coalesce(1).write.mode("overwrite").option("compression", "snappy").parquet(
+        eventsEnrolmentDataDFWithKarmaPoints.write.mode("overwrite").option("compression", "snappy").parquet(
             f"{warehouse_path}/event_enrolment_details")
         print(f"✓ Written: {warehouse_path}/event_enrolment_details")
         

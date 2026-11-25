@@ -328,12 +328,5 @@ def preComputeUserEnrolmentWarehouseData(spark):
         )
     
     # create summary of igot and marketplace enrolments counts
-    print("===== igot and marketplace enrolments summary =====")
-    print(f"----- igot enrolled count: {platform_enrolments_df.filter(col('enrolment_status') == 'enrolled').count()} ---")
-    print(f"----- igot unenrolled count: {platform_enrolments_df.filter(col('enrolment_status') == 'unenrolled').count()} ---")
-    print(f"----- igot count: {platform_enrolments_df.count()} ---")
-    print(f"----- marketplace count: {marketplace_enrolments_df.count()} ---")
-    print(f"----- combined count: {platform_enrolments_df.count() + marketplace_enrolments_df.count()} ---")
-    print("===== end of summary =====")
     combined_enrolments_df = platform_enrolments_df.union(marketplace_enrolments_df)
     exportDFToParquet(combined_enrolments_df,ParquetFileConstants.ENROLMENT_WAREHOUSE_COMPUTED_PARQUET_FILE)

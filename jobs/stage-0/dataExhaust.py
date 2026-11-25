@@ -730,7 +730,7 @@ class DataExhaustModel:
             events_enrolment_with_duration_df = self.duration_format(events_enrolment_with_duration_df,
                                                                      "progress_duration")
 
-            self.write_parquet(events_enrolment_with_duration_df.coalesce(1),
+            self.write_parquet(events_enrolment_with_duration_df,
                                f"{output_base_path}/eventEnrolmentDetails")
             event_details_df.unpersist()
             events_enrolment_df.unpersist()

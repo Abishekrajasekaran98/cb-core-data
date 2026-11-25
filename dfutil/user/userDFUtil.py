@@ -300,7 +300,7 @@ def preComputeUserWarehouseData(spark):
         )
 
         # Write warehouse data
-        exportDFToParquet(warehouseDF.coalesce(1), ParquetFileConstants.USER_WAREHOUSE_COMPUTED_PARQUET_FILE)
+        exportDFToParquet(warehouseDF, ParquetFileConstants.USER_WAREHOUSE_COMPUTED_PARQUET_FILE)
         print(f"User warehouse data generation completed")
         return warehouseDF
 

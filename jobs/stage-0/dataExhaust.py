@@ -75,7 +75,7 @@ class DataExhaustModel:
 
     def write_parquet(self, df: "DataFrame", path: str, partition_cols: list = None, mode: str = "overwrite"):
         """Write DataFrame to Parquet with optimization"""
-        writer = df.coalesce(16)
+        writer = df
 
         if partition_cols:
             writer = writer.write.partitionBy(*partition_cols)

@@ -816,6 +816,12 @@ class DataExhaustModel:
             self.write_parquet(course_completion_survey_df, f"{output_base_path}/courseCompletionSurvey")
             course_completion_survey_df.unpersist()
             self.logger.info("course completion survey data processing completed.")
+
+            # Processing Karma Coin
+            self.logger.info("Processing karma coin data...")
+            karma_coin_df = self.read_cassandra_table("sunbird", "user_karma_coin_transactions")
+            self.write_parquet(karma_coin_df, "/home/analytics/pyspark/warehouse/karma_coin_transaction")
+            self.logger.info("karma coin data processing completed")
             
             self.logger.info("Data processing completed successfully!")
 

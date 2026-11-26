@@ -93,21 +93,22 @@ class CourseCompletionSurveyReport:
                    col("version").alias("survey_version"),
                    col("data_last_generated_on"))
 
-            (warehouseDF.coalesce(1)
+            (warehouseDF
                .write
                .mode("overwrite")
                .option("compression", "snappy")
                .parquet(f"{config.warehouseReportDir}/{config.dwCourseCompletionSurveryTable}"))
 
             print("Stage4 : Complete")
-
-            dfexportutil.write_csv_per_mdo_id_duckdb(
-                reportDF,
-                f"{config.localReportDir}/{config.courseCompletionSurveyPath}/{today}",
-                'formId',
-                f"{config.localReportDir}/temp/course-completion-survey-report/{today}",
-                csv_filename=config.completionSurveyReport
-               )
+            coursecompletionpath = f"{config.localReportDir}/temp/course-completion-survey-report/{today}"
+            reportDF.write.mode("overwrite").option("compression", "snappy").parquet(coursecompletionpath)
+            # dfexportutil.write_csv_per_mdo_id_duckdb(
+            #     reportDF,
+            #     f"{config.localReportDir}/{config.courseCompletionSurveyPath}/{today}",
+            #     'formId',
+            #     f"{config.localReportDir}/temp/course-completion-survey-report/{today}",
+            #     csv_filename=config.completionSurveyReport
+            #    )
             total_time = time.time() - start_time
             print(
                 f"\n✅ Optimized Course Completion Survey Report generation completed in {total_time:.2f} seconds ({total_time / 60:.1f} minutes)")
